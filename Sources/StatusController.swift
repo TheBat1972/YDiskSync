@@ -8,7 +8,6 @@ final class StatusController: NSObject, NSMenuDelegate {
     private var usage = ""
     private var animTimer: Timer?
     private var angle: CGFloat = 0
-    private var spinBase: NSImage?
 
     var onOpenSettings: (() -> Void)?
     var onOpenActivity: (() -> Void)?
@@ -30,41 +29,54 @@ final class StatusController: NSObject, NSMenuDelegate {
 
     // MARK: значок
 
+    /// Буква рядом со значком отличает этот клиент от второго.
+    static let letter = "Я"
+    private var spinBase: NSImage?
+
     private func symbol(_ names: [String]) -> NSImage? {
         for n in names {
-            if let img = NSImage(systemSymbolName: n, accessibilityDescription: "Яндекс Диск") {
-                img.isTemplate = true
-                return img
-            }
+            if let img = NSImage(systemSymbolName: n, accessibilityDescription: "Яндекс Диск") { return img }
         }
         return nil
     }
 
-    private func rotated(_ img: NSImage, _ degrees: CGFloat) -> NSImage {
+    /// Значок (можно повернуть) + буква справа. Шаблонное изображение — подстраивается под тёмную/светлую строку меню.
+    private func compose(_ base: NSImage?, rotation: CGFloat = 0, alpha: CGFloat = 1) -> NSImage {
         let side: CGFloat = 18
-        let out = NSImage(size: NSSize(width: side, height: side))
-        out.lockFocus()
-        let t = NSAffineTransform()
-        t.translateX(by: side / 2, yBy: side / 2)
-        t.rotate(byDegrees: degrees)
-        t.translateX(by: -side / 2, yBy: -side / 2)
-        t.concat()
-        let s = img.size
-        let k = min(side / s.width, side / s.height) * 0.9
-        let w = s.width * k, h = s.height * k
-        img.draw(in: NSRect(x: (side - w) / 2, y: (side - h) / 2, width: w, height: h))
-        out.unlockFocus()
-        out.isTemplate = true
-        return out
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11, weight: .heavy),
+            .foregroundColor: NSColor.black.withAlphaComponent(alpha)]
+        let letter = StatusController.letter as NSString
+        let ls = letter.size(withAttributes: attrs)
+        let img = NSImage(size: NSSize(width: side + 1 + ls.width, height: side), flipped: false) { _ in
+            if let base = base {
+                NSGraphicsContext.saveGraphicsState()
+                let t = NSAffineTransform()
+                t.translateX(by: side / 2, yBy: side / 2)
+                t.rotate(byDegrees: rotation)
+                t.translateX(by: -side / 2, yBy: -side / 2)
+                t.concat()
+                let s = base.size
+                let k = min(side / s.width, side / s.height) * 0.9
+                let w = s.width * k, h = s.height * k
+                base.draw(in: NSRect(x: (side - w) / 2, y: (side - h) / 2, width: w, height: h),
+                          from: .zero, operation: .sourceOver, fraction: alpha)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+            letter.draw(at: NSPoint(x: side + 1, y: (side - ls.height) / 2), withAttributes: attrs)
+            return true
+        }
+        img.isTemplate = true
+        return img
     }
 
     private func startSpinning() {
         guard animTimer == nil else { return }
         spinBase = symbol(["arrow.triangle.2.circlepath"])
         animTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self = self, let base = self.spinBase else { return }
+            guard let self = self else { return }
             self.angle -= 30
-            self.item.button?.image = self.rotated(base, self.angle)
+            self.item.button?.image = self.compose(self.spinBase, rotation: self.angle)
         }
     }
 
@@ -79,25 +91,25 @@ final class StatusController: NSObject, NSMenuDelegate {
         switch s {
         case .syncing(_, let fraction):
             startSpinning()
+            item.button?.image = compose(spinBase ?? symbol(["arrow.triangle.2.circlepath"]), rotation: angle)
             if let f = fraction { item.button?.title = " \(Int(f * 100))%" } else { item.button?.title = "" }
         case .error, .needsConfirmation:
             stopSpinning()
             item.button?.title = ""
-            item.button?.image = symbol(["externaldrive.badge.exclamationmark", "exclamationmark.triangle"])
+            item.button?.image = compose(symbol(["externaldrive.badge.exclamationmark", "exclamationmark.triangle"]))
         case .paused:
             stopSpinning()
             item.button?.title = ""
-            item.button?.image = symbol(["pause.circle"])
+            item.button?.image = compose(symbol(["pause.circle"]))
         case .idle:
             stopSpinning()
             item.button?.title = ""
-            item.button?.image = symbol(["externaldrive.badge.checkmark", "externaldrive"])
+            item.button?.image = compose(symbol(["externaldrive.badge.checkmark", "externaldrive"]))
         case .notConfigured:
             stopSpinning()
             item.button?.title = ""
-            item.button?.image = symbol(["externaldrive.badge.questionmark", "externaldrive"])
+            item.button?.image = compose(symbol(["externaldrive.badge.questionmark", "externaldrive"]), alpha: 0.5)
         }
-        if item.button?.image == nil { item.button?.title = "Я" }
         rebuild()
     }
 
