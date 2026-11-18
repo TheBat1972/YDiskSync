@@ -289,8 +289,7 @@ struct SettingsView: View {
             }
             HStack {
                 Button("Включить «Ссылка Яндекс Диска» в меню Finder") {
-                    ServiceSetup.enable()
-                    ServiceSetup.openKeyboardSettings()
+                    ServiceSetup.enableWithGuide()
                 }
                 Text("правый клик → Службы").font(.caption).foregroundColor(.secondary)
                 Spacer()
