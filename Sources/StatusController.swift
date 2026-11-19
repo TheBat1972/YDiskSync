@@ -40,33 +40,71 @@ final class StatusController: NSObject, NSMenuDelegate {
         return nil
     }
 
-    /// Значок (можно повернуть) + буква справа. Шаблонное изображение — подстраивается под тёмную/светлую строку меню.
+    /// Состояние синхронизации; от него зависит цвет буквы клиента.
+    private enum Mark { case ok, fail, warn, work, pause, none }
+
+    private var currentMark: Mark {
+        switch status {
+        case .idle: return .ok
+        case .error: return .fail
+        case .needsConfirmation: return .warn
+        case .syncing: return .work
+        case .paused: return .pause
+        case .notConfigured: return .none
+        }
+    }
+
+    /// Цвет состояния — им же окрашена буква клиента.
+    private func markColor(_ m: Mark, gray: NSColor) -> NSColor {
+        switch m {
+        case .ok: return .systemGreen
+        case .fail: return .systemRed
+        case .warn: return .systemOrange
+        case .work: return .systemBlue
+        case .pause, .none: return gray
+        }
+    }
+
+    /// Значок (можно повернуть) + буква справа, окрашенная по состоянию.
+    /// Изображение не шаблонное: цвет значка и буквы подбирается под тёмную/светлую строку меню.
     private func compose(_ base: NSImage?, rotation: CGFloat = 0, alpha: CGFloat = 1) -> NSImage {
         let side: CGFloat = 18
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 11, weight: .heavy),
-            .foregroundColor: NSColor.black.withAlphaComponent(alpha)]
+        let markW: CGFloat = 0
+        let mark = currentMark
+        let font = NSFont.systemFont(ofSize: 11, weight: .heavy)
         let letter = StatusController.letter as NSString
-        let ls = letter.size(withAttributes: attrs)
-        let img = NSImage(size: NSSize(width: side + 1 + ls.width, height: side), flipped: false) { _ in
+        let ls = letter.size(withAttributes: [.font: font])
+        let img = NSImage(size: NSSize(width: markW + side + 1 + ls.width, height: side), flipped: false) { [weak self] _ in
+            let dark = self?.item.button?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let fg = (dark ? NSColor.white : NSColor.black).withAlphaComponent(alpha)
+            let gray = (dark ? NSColor.white : NSColor.black).withAlphaComponent(0.45)
+
+
             if let base = base {
-                NSGraphicsContext.saveGraphicsState()
-                let t = NSAffineTransform()
-                t.translateX(by: side / 2, yBy: side / 2)
-                t.rotate(byDegrees: rotation)
-                t.translateX(by: -side / 2, yBy: -side / 2)
-                t.concat()
                 let s = base.size
                 let k = min(side / s.width, side / s.height) * 0.9
                 let w = s.width * k, h = s.height * k
-                base.draw(in: NSRect(x: (side - w) / 2, y: (side - h) / 2, width: w, height: h),
-                          from: .zero, operation: .sourceOver, fraction: alpha)
+                let tinted = NSImage(size: NSSize(width: w, height: h), flipped: false) { r in
+                    base.draw(in: r)
+                    fg.set()
+                    r.fill(using: .sourceAtop)
+                    return true
+                }
+                NSGraphicsContext.saveGraphicsState()
+                let t = NSAffineTransform()
+                t.translateX(by: markW + side / 2, yBy: side / 2)
+                t.rotate(byDegrees: rotation)
+                t.translateX(by: -(markW + side / 2), yBy: -side / 2)
+                t.concat()
+                tinted.draw(in: NSRect(x: markW + (side - w) / 2, y: (side - h) / 2, width: w, height: h))
                 NSGraphicsContext.restoreGraphicsState()
             }
-            letter.draw(at: NSPoint(x: side + 1, y: (side - ls.height) / 2), withAttributes: attrs)
+            letter.draw(at: NSPoint(x: markW + side + 1, y: (side - ls.height) / 2),
+                        withAttributes: [.font: font,
+                                         .foregroundColor: (self?.markColor(mark, gray: gray) ?? fg).withAlphaComponent(alpha)])
             return true
         }
-        img.isTemplate = true
+        img.isTemplate = false
         return img
     }
 

@@ -121,42 +121,85 @@ final class YandexAPI {
                         total: (o["total_space"] as? NSNumber)?.int64Value ?? 0)
     }
 
-    /// Рекурсивный список всего содержимого папки. Ключ — относительный путь (NFC).
-    /// nil, если самой папки на Диске нет.
-    func listTree(root: String) throws -> [String: RemoteItem]? {
-        var result: [String: RemoteItem] = [:]
-        var stack = [root]
+    /// Содержимое одной папки (все страницы). nil — папки нет.
+    private func listOne(_ dir: String, root: String) throws -> [(String, RemoteItem)]? {
+        var out: [(String, RemoteItem)] = []
+        var offset = 0
         let fields = "_embedded.items.name,_embedded.items.type,_embedded.items.size,"
             + "_embedded.items.md5,_embedded.items.modified"
-        while let dir = stack.popLast() {
-            var offset = 0
-            while true {
-                let (d, c) = try api("GET", "/resources",
-                                     [("path", dir), ("limit", "1000"),
-                                      ("offset", String(offset)), ("fields", fields)])
-                if c == 404 {
-                    if dir == root { return nil }
-                    break
-                }
-                guard c == 200, let o = json(d) else { throw SyncError.http(c, message(d)) }
-                let items = ((o["_embedded"] as? [String: Any])?["items"] as? [[String: Any]]) ?? []
-                for it in items {
-                    guard let name = it["name"] as? String, let type = it["type"] as? String else { continue }
-                    let childPath = (dir == "/" ? "" : dir) + "/" + name
-                    let rel = String(childPath.dropFirst(root == "/" ? 1 : root.count + 1))
-                    let isDir = type == "dir"
-                    let modified = (it["modified"] as? String).flatMap { YandexAPI.iso.date(from: $0) } ?? Date()
-                    result[rel.precomposedStringWithCanonicalMapping] = RemoteItem(
-                        isDir: isDir,
-                        size: (it["size"] as? NSNumber)?.int64Value ?? 0,
-                        md5: it["md5"] as? String,
-                        modified: modified,
-                        apiPath: childPath)
-                    if isDir { stack.append(childPath) }
-                }
-                if items.count < 1000 { break }
-                offset += items.count
+        while true {
+            let (d, c) = try api("GET", "/resources",
+                                 [("path", dir), ("limit", "1000"),
+                                  ("offset", String(offset)), ("fields", fields)])
+            if c == 404 { return offset == 0 ? nil : out }
+            guard c == 200, let o = json(d) else { throw SyncError.http(c, message(d)) }
+            let items = ((o["_embedded"] as? [String: Any])?["items"] as? [[String: Any]]) ?? []
+            for it in items {
+                guard let name = it["name"] as? String, let type = it["type"] as? String else { continue }
+                let childPath = (dir == "/" ? "" : dir) + "/" + name
+                let rel = String(childPath.dropFirst(root == "/" ? 1 : root.count + 1))
+                let modified = (it["modified"] as? String).flatMap { YandexAPI.iso.date(from: $0) } ?? Date()
+                out.append((rel.precomposedStringWithCanonicalMapping, RemoteItem(
+                    isDir: type == "dir",
+                    size: (it["size"] as? NSNumber)?.int64Value ?? 0,
+                    md5: it["md5"] as? String,
+                    modified: modified,
+                    apiPath: childPath)))
             }
+            if items.count < 1000 { break }
+            offset += items.count
+        }
+        return out
+    }
+
+    /// Рекурсивный список всего содержимого папки. Ключ — относительный путь (NFC).
+    /// nil, если самой папки на Диске нет.
+    /// Папки читаются по уровням, по 4 запроса одновременно.
+    /// progress(папок прочитано, объектов найдено) вызывается из фоновых потоков.
+    func listTree(root: String, progress: ((Int, Int) -> Void)? = nil) throws -> [String: RemoteItem]? {
+        var result: [String: RemoteItem] = [:]
+        var level = [root]
+        var folders = 0
+        let lock = NSLock()
+        let q = DispatchQueue.global(qos: .utility)
+        while !level.isEmpty {
+            var next: [String] = []
+            var firstError: Error?
+            var rootMissing = false
+            let limiter = DispatchSemaphore(value: 4)
+            let group = DispatchGroup()
+            for dir in level {
+                lock.lock(); let stop = firstError != nil; lock.unlock()
+                if stop { break }
+                limiter.wait()
+                group.enter()
+                q.async {
+                    defer { limiter.signal(); group.leave() }
+                    do {
+                        guard let items = try self.listOne(dir, root: root) else {
+                            if dir == root { lock.lock(); rootMissing = true; lock.unlock() }
+                            return
+                        }
+                        lock.lock()
+                        for (rel, item) in items {
+                            result[rel] = item
+                            if item.isDir { next.append(item.apiPath) }
+                        }
+                        folders += 1
+                        let f = folders, n = result.count
+                        lock.unlock()
+                        progress?(f, n)
+                    } catch {
+                        lock.lock()
+                        if firstError == nil { firstError = error }
+                        lock.unlock()
+                    }
+                }
+            }
+            group.wait()
+            if let e = firstError { throw e }
+            if rootMissing { return nil }
+            level = next
         }
         return result
     }
