@@ -224,6 +224,14 @@ final class YandexAPI {
         return names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
 
+    /// md5 файла на Диске; nil — файла нет.
+    func remoteMD5(_ path: String) throws -> String? {
+        let (d, c) = try api("GET", "/resources", [("path", path), ("fields", "md5,type")])
+        if c == 404 { return nil }
+        guard c == 200, let o = json(d) else { throw SyncError.http(c, message(d)) }
+        return o["md5"] as? String
+    }
+
     func makeDir(_ path: String) throws {
         let (d, c) = try api("PUT", "/resources", [("path", path)])
         if c == 201 { return }

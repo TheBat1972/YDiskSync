@@ -36,6 +36,9 @@ func fileMD5(_ url: URL) throws -> String {
     return hasher.finalize().map { String(format: "%02x", $0) }.joined()
 }
 
+/// Цикл прерван, потому что на Маке появились новые изменения (не ошибка).
+private struct CycleInterrupted: Error {}
+
 /// Двусторонняя синхронизация выбранных папок Диска с локальной папкой.
 /// Локальная папка зеркалит корень Диска: «/Документы/a.txt» ↔ «<папка>/Документы/a.txt».
 final class SyncEngine {
@@ -51,6 +54,13 @@ final class SyncEngine {
     private var lastLoggedError: String?
     private let monitor = NWPathMonitor()
     private var online = true
+
+    // Копия списка Диска для циклов, вызванных правкой на Маке: читать весь Диск заново после каждого
+    // скопированного файла слишком долго. Таймер и кнопка «Синхронизировать сейчас» всегда читают заново.
+    private var remoteCache: [String: RemoteItem]?
+    private var remoteCacheSel: [String] = []
+    private var remoteCacheDate = Date.distantPast
+    private var pendingFull = true
 
     init() { startMonitoring() }
 
@@ -85,18 +95,19 @@ final class SyncEngine {
 
     func reschedule() {
         timer?.invalidate(); timer = nil
+        lock.lock(); remoteCache = nil; pendingFull = true; lock.unlock()
         watcher?.stop(); watcher = nil
         guard settings.isConfigured else { onStatus?(.notConfigured); return }
         if settings.paused { onStatus?(.paused); return }
         timer = Timer.scheduledTimer(withTimeInterval: Double(settings.intervalMinutes) * 60,
                                      repeats: true) { [weak self] _ in self?.requestSync() }
-        let w = FolderWatcher { [weak self] in self?.requestSync() }
+        let w = FolderWatcher { [weak self] in self?.requestSync(fullRead: false) }
         w.start(path: settings.localFolder)
         watcher = w
         requestSync()
     }
 
-    func requestSync(allowMassDelete: Bool = false) {
+    func requestSync(allowMassDelete: Bool = false, fullRead: Bool = true) {
         guard settings.isConfigured, !settings.paused else { return }
         if !isOnline {
             // Флаг мог устареть (система не всегда сообщает, что сеть вернулась) — проверяем по-настоящему.
@@ -104,7 +115,7 @@ final class SyncEngine {
                 guard let self = self else { return }
                 if ok {
                     self.setOnline(true)
-                    DispatchQueue.main.async { self.requestSync(allowMassDelete: allowMassDelete) }
+                    DispatchQueue.main.async { self.requestSync(allowMassDelete: allowMassDelete, fullRead: fullRead) }
                 } else {
                     self.onStatus?(.error("Нет подключения к интернету — синхронизация продолжится, когда сеть вернётся"))
                     self.retryIfTransient(SyncError.network("нет связи"))
@@ -114,6 +125,7 @@ final class SyncEngine {
         }
         lock.lock()
         if allowMassDelete { pendingAllowDelete = true }
+        if fullRead { pendingFull = true }
         if running { pending = true; lock.unlock(); return }
         running = true
         lock.unlock()
@@ -124,14 +136,18 @@ final class SyncEngine {
         while true {
             lock.lock()
             let allow = pendingAllowDelete
+            let full = pendingFull
+            pendingFull = false
             pendingAllowDelete = false
             pending = false
             lock.unlock()
             do {
-                let summary = try runCycle(allowMassDelete: allow)
+                let summary = try runCycle(allowMassDelete: allow, fullRead: full)
                 lastLoggedError = nil
                 retryReset()
                 onStatus?(.idle(Date(), summary))
+            } catch is CycleInterrupted {
+                // состояние сохранено, следующий проход составит новый план
             } catch SyncError.needsConfirmation(let m) {
                 ActivityLog.shared.add(.error, "Нужно подтверждение удаления", m)
                 onStatus?(.needsConfirmation(m))
@@ -254,7 +270,7 @@ final class SyncEngine {
 
     // MARK: - Один цикл
 
-    private func runCycle(allowMassDelete: Bool) throws -> String {
+    private func runCycle(allowMassDelete: Bool, fullRead: Bool) throws -> String {
         guard let token = settings.token, settings.isConfigured else { throw SyncError.notConfigured }
         let fm = FileManager.default
         let localRoot = URL(fileURLWithPath: settings.localFolder, isDirectory: true)
@@ -311,9 +327,17 @@ final class SyncEngine {
 
         // Диск
         var remote: [String: RemoteItem] = [:]
+        lock.lock()
+        let cached = remoteCache
+        let cachedDate = remoteCacheDate
+        let usedCache = !fullRead && cached != nil && remoteCacheSel == selections
+            && Date().timeIntervalSince(cachedDate) < 900
+        remoteCache = nil                  // вернём только после успешного цикла
+        lock.unlock()
+        if usedCache, let c = cached { remote = c }
         let readStart = Date()
         var lastTick = Date.distantPast
-        for sel in selections {
+        for sel in selections where !usedCache {
             let selRel = sel == "/" ? "" : String(sel.dropFirst())
             let dirItem = RemoteItem(isDir: true, size: 0, md5: nil, modified: Date(), apiPath: sel)
             let tree = try api.listTree(root: sel) { folders, objects in
@@ -335,8 +359,10 @@ final class SyncEngine {
             // иначе папку удалили на Диске: локальные копии уйдут по правилам удаления
         }
 
-        ActivityLog.shared.add(.info, "Список Диска получен: \(remote.count) объектов",
-                               String(format: "за %.0f с", Date().timeIntervalSince(readStart)))
+        if !usedCache {
+            ActivityLog.shared.add(.info, "Список Диска получен: \(remote.count) объектов",
+                                   String(format: "за %.0f с", Date().timeIntervalSince(readStart)))
+        }
         onStatus?(.syncing("Просмотр папки на Маке…", nil))
 
         // Локальная папка (только то, что внутри выбранного)
@@ -404,18 +430,40 @@ final class SyncEngine {
         // Защита от массового удаления
         let dels = delLocal.count + delRemote.count
         let stateCount = state.keys.filter(inSelection).count
-        if !allowMassDelete && dels >= 10 && (dels * 2 > stateCount || dels >= 100) {
+        if !allowMassDelete && UserDefaults.standard.bool(forKey: "confirmMassDelete") && dels >= 10 && (dels * 2 > stateCount || dels >= 100) {
             throw SyncError.needsConfirmation(
                 "Нужно удалить \(dels) объектов (здесь: \(delLocal.count), на Диске: \(delRemote.count)). Подтвердите в меню.")
+        }
+
+        // Копия списка могла устареть: файл, который хотим перезаписать, мог измениться на Диске — тогда читаем заново.
+        if usedCache {
+            for rel in up {
+                guard let cur = remote[rel], !cur.isDir else { continue }
+                let now = try? api.remoteMD5(remotePath(rel))
+                if now == nil || now! != cur.md5 {
+                    lock.lock(); pendingFull = true; pending = true; lock.unlock()
+                    return ""
+                }
+            }
         }
 
         // MARK: выполнение
         let total = mkLocal.count + mkRemote.count + down.count + up.count + conflicts.count + dels
         var done = 0
         var nDown = 0, nUp = 0, nDel = 0, nConf = 0
-        func step(_ text: String) {
+        var lastPoll = Date()
+        func step(_ text: String) throws {
             done += 1
             onStatus?(.syncing("\(text) (\(done) из \(total))", total > 0 ? Double(done - 1) / Double(total) : nil))
+            // Пользователь изменил файлы, пока мы работали, — план устарел: сохраняем сделанное и планируем заново.
+            if Date().timeIntervalSince(lastPoll) > 2 {
+                lastPoll = Date()
+                lock.lock(); let again = pending; lock.unlock()
+                if again && done < total {
+                    saveState(newState, stateURL)
+                    throw CycleInterrupted()
+                }
+            }
         }
         func fail(_ rel: String, _ error: Error) throws {
             var fatal = false
@@ -453,13 +501,14 @@ final class SyncEngine {
             let md5 = try fileMD5(url)
             let st = try statLocal(url)
             try api.upload(url, to: remotePath(rel))
+            remote[rel] = RemoteItem(isDir: false, size: st.size, md5: md5, modified: Date(), apiPath: remotePath(rel))
             newState[rel] = FileState(isDir: false, md5: md5, size: st.size, mtime: st.mtime)
             nUp += 1
             ActivityLog.shared.add(.upload, "Загружено на Диск: " + name(rel), rel)
         }
 
         for rel in mkLocal.sorted() {
-            step("Папка " + (rel as NSString).lastPathComponent)
+            try step("Папка " + (rel as NSString).lastPathComponent)
             do {
                 try fm.createDirectory(at: localURL(rel), withIntermediateDirectories: true)
                 newState[rel] = FileState(isDir: true, md5: nil, size: 0, mtime: 0)
@@ -467,25 +516,26 @@ final class SyncEngine {
             } catch { try fail(rel, error) }
         }
         for rel in mkRemote.sorted() {
-            step("Папка " + (rel as NSString).lastPathComponent)
+            try step("Папка " + (rel as NSString).lastPathComponent)
             do {
                 try api.makeDir(remotePath(rel))
+                remote[rel] = RemoteItem(isDir: true, size: 0, md5: nil, modified: Date(), apiPath: remotePath(rel))
                 newState[rel] = FileState(isDir: true, md5: nil, size: 0, mtime: 0)
                 ActivityLog.shared.add(.folder, "Создана папка на Диске: " + name(rel), rel)
             } catch { try fail(rel, error) }
         }
         for rel in down.sorted() {
             guard let r = remote[rel] else { continue }
-            step("↓ " + (rel as NSString).lastPathComponent)
+            try step("↓ " + (rel as NSString).lastPathComponent)
             do { try doDownload(rel, r) } catch { try fail(rel, error) }
         }
         for rel in up.sorted() {
-            step("↑ " + (rel as NSString).lastPathComponent)
+            try step("↑ " + (rel as NSString).lastPathComponent)
             do { try doUpload(rel) } catch { try fail(rel, error) }
         }
         for rel in conflicts.sorted() {
             guard let r = remote[rel] else { continue }
-            step("Конфликт: " + (rel as NSString).lastPathComponent)
+            try step("Конфликт: " + (rel as NSString).lastPathComponent)
             do {
                 // Локальную версию сохраняем рядом как копию, с Диска берём свежую
                 let url = localURL(rel)
@@ -508,7 +558,7 @@ final class SyncEngine {
         // Удаления: сначала файлы, потом папки (от самых вложенных)
         let delRemoteSet = Set(delRemote)
         for rel in delLocal.sorted() where local[rel]?.isDir == false {
-            step("Удаление " + (rel as NSString).lastPathComponent)
+            try step("Удаление " + (rel as NSString).lastPathComponent)
             do {
                 try fm.trashItem(at: localURL(rel), resultingItemURL: nil)
                 newState[rel] = nil
@@ -517,16 +567,17 @@ final class SyncEngine {
             } catch { try fail(rel, error) }
         }
         for rel in delRemote.sorted() where remote[rel]?.isDir == false {
-            step("Удаление на Диске " + (rel as NSString).lastPathComponent)
+            try step("Удаление на Диске " + (rel as NSString).lastPathComponent)
             do {
                 try api.delete(remote[rel]?.apiPath ?? remotePath(rel))
+                remote[rel] = nil
                 newState[rel] = nil
                 nDel += 1
                 ActivityLog.shared.add(.delete, "Удалено с Диска (вы удалили на Маке): " + name(rel), rel)
             } catch { try fail(rel, error) }
         }
         for rel in delLocal.sorted(by: { $0.count > $1.count }) where local[rel]?.isDir == true {
-            step("Удаление папки " + (rel as NSString).lastPathComponent)
+            try step("Удаление папки " + (rel as NSString).lastPathComponent)
             do {
                 let names = (try? fm.contentsOfDirectory(atPath: localURL(rel).path)) ?? []
                 if names.contains(where: { !$0.hasPrefix(".") }) {
@@ -540,13 +591,14 @@ final class SyncEngine {
             } catch { try fail(rel, error) }
         }
         for rel in delRemote.sorted(by: { $0.count > $1.count }) where remote[rel]?.isDir == true {
-            step("Удаление папки на Диске " + (rel as NSString).lastPathComponent)
+            try step("Удаление папки на Диске " + (rel as NSString).lastPathComponent)
             do {
                 let survivors = remote.keys.contains { $0.hasPrefix(rel + "/") && !delRemoteSet.contains($0) }
                 if survivors {
                     newState[rel] = nil          // на Диске в папке есть новое — оставляем, скачаем
                 } else {
                     try api.delete(remote[rel]?.apiPath ?? remotePath(rel))
+                    remote[rel] = nil
                     newState[rel] = nil
                     nDel += 1
                     ActivityLog.shared.add(.delete, "Удалена папка с Диска (вы удалили на Маке): " + name(rel), rel)
@@ -555,8 +607,15 @@ final class SyncEngine {
         }
 
         saveState(newState, stateURL)
+        if errors.isEmpty {
+            lock.lock()
+            remoteCache = remote
+            remoteCacheSel = selections
+            remoteCacheDate = usedCache ? cachedDate : readStart
+            lock.unlock()
+        }
         if rerunSoon {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.requestSync() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.requestSync(fullRead: false) }
         }
         var parts: [String] = []
         if nDown > 0 { parts.append("скачано: \(nDown)") }

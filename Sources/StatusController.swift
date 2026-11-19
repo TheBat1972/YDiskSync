@@ -205,9 +205,6 @@ final class StatusController: NSObject, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
-        if case .needsConfirmation = status {
-            action("Подтвердить удаление и синхронизировать", #selector(confirmDeletes))
-        }
         if Settings.shared.isConfigured {
             action("Синхронизировать сейчас", #selector(syncNow), "r")
             action(Settings.shared.paused ? "Возобновить" : "Приостановить", #selector(togglePause))
