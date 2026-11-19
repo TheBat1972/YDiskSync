@@ -180,7 +180,12 @@ final class StatusController: NSObject, NSMenuDelegate {
         switch status {
         case .notConfigured: line("Нужна настройка: подключите аккаунт и выберите папки")
         case .paused: line("Синхронизация приостановлена")
-        case .syncing(let t, _): line(t)
+        case .syncing(let t, _):
+            line(t)
+            let plan = ActivityLog.shared.plan
+            if !plan.isEmpty { line(plan) }
+            let speed = ActivityLog.shared.speed
+            if !speed.isEmpty { line(speed) }
         case .idle(let date, let summary):
             let f = DateFormatter(); f.dateFormat = "HH:mm"
             line("Синхронизировано в \(f.string(from: date))")

@@ -48,6 +48,9 @@ struct ActivityView: View {
                         ProgressView().progressViewStyle(LinearProgressViewStyle())
                     }
                     Text(log.step).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    if !log.speed.isEmpty {
+                        Text(log.speed).font(.caption).foregroundColor(.secondary).lineLimit(1)
+                    }
                 } else {
                     if !log.step.isEmpty {
                         Text(log.step).font(.caption).foregroundColor(.secondary).lineLimit(2)
