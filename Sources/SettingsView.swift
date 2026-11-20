@@ -4,6 +4,19 @@ import ServiceManagement
 
 // MARK: - Дерево папок Диска
 
+/// Цвета подписей: подбираются отдельно для светлой и тёмной темы, чтобы текст читался (контраст не ниже ~4.5:1).
+enum TagColor {
+    static func dyn(_ light: NSColor, _ dark: NSColor) -> Color {
+        Color(NSColor(name: nil) { $0.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light })
+    }
+    static let mac = dyn(NSColor(srgbRed: 0.00, green: 0.45, blue: 0.14, alpha: 1),
+                         NSColor(srgbRed: 0.38, green: 0.86, blue: 0.48, alpha: 1))
+    static let cloud = dyn(NSColor(srgbRed: 0.00, green: 0.34, blue: 0.78, alpha: 1),
+                           NSColor(srgbRed: 0.45, green: 0.72, blue: 1.00, alpha: 1))
+    static let warn = dyn(NSColor(srgbRed: 0.70, green: 0.33, blue: 0.00, alpha: 1),
+                          NSColor(srgbRed: 1.00, green: 0.72, blue: 0.32, alpha: 1))
+}
+
 final class FolderNode: ObservableObject, Identifiable {
     let name: String
     let path: String
@@ -11,6 +24,10 @@ final class FolderNode: ObservableObject, Identifiable {
     @Published var expanded = false
     @Published var loading = false
     @Published var error: String? = nil
+    /// Папка есть только на Маке, в хранилище её ещё нет (появится после отметки галочкой).
+    var localOnly = false
+    /// Папка есть в хранилище, но на Маке её нет.
+    var cloudOnly = false
     var id: String { path }
 
     init(name: String, path: String) {
@@ -23,14 +40,19 @@ final class FolderTreeModel: ObservableObject {
     let root = FolderNode(name: "Диск", path: "/")
     /// Отмеченные пути. "/" — корень, то есть весь Диск.
     @Published var selected: Set<String>
+    /// Исключения: папки внутри выбранной, которые синхронизировать не нужно.
+    @Published var excluded: Set<String>
 
     init() {
-        selected = Settings.shared.selectionConfirmed ? Set(Settings.shared.selectedFolders) : []
+        let st = Settings.shared
+        selected = st.selectionConfirmed ? Set(st.selectedFolders) : []
+        excluded = st.selectionConfirmed ? Set(st.excludedFolders) : []
     }
 
     var result: [String] { Settings.normalize(Array(selected)) }
+    var excludedResult: [String] { Settings.normalize(Array(excluded)) }
 
-    var summary: String {
+    var baseSummary: String {
         if selected.contains("/") { return "Весь Диск" }
         if selected.isEmpty { return "Ничего не выбрано" }
         let names = selected.sorted().map { $0.hasPrefix("/") ? String($0.dropFirst()) : $0 }
@@ -38,47 +60,120 @@ final class FolderTreeModel: ObservableObject {
         return names.count > 3 ? "\(shown) и ещё \(names.count - 3)" : shown
     }
 
-    /// Выбрана ли уже сама папка или её родитель (тогда вложенные включены автоматически).
-    /// Внутри папки выбрана какая-то вложенная папка (сама папка при этом не отмечена).
-    func hasNestedSelection(_ path: String) -> Bool {
-        selected.contains { $0.hasPrefix(path + "/") }
+    var summary: String {
+        if selected.isEmpty { return "Ничего не выбрано" }
+        if excluded.isEmpty { return baseSummary }
+        let names = excluded.sorted().map { $0.hasPrefix("/") ? String($0.dropFirst()) : $0 }
+        let shown = names.prefix(3).joined(separator: ", ")
+        return baseSummary + "; кроме: " + (names.count > 3 ? "\(shown) и ещё \(names.count - 3)" : shown)
     }
 
-    func isCovered(_ path: String) -> Bool {
-        selected.contains("/") || selected.contains { path.hasPrefix($0 + "/") }
+    /// Правило, действующее для пути: ближайшее (самое глубокое) из выбранных или исключённых.
+    private func nearestRule(_ path: String, ignoring: String? = nil) -> (len: Int, included: Bool)? {
+        var best: (len: Int, included: Bool)? = nil
+        func consider(_ r: String, _ inc: Bool) {
+            if r == ignoring { return }
+            guard r == "/" || path == r || path.hasPrefix(r + "/") else { return }
+            let len = r == "/" ? 0 : r.count
+            if let b = best, b.len > len { return }
+            best = (len, inc)
+        }
+        for r in selected { consider(r, true) }
+        for r in excluded { consider(r, false) }
+        return best
     }
+
+    /// Синхронизируется ли папка (выбрана сама или внутри выбранной и не исключена).
+    func isIncluded(_ path: String) -> Bool { nearestRule(path)?.included ?? false }
+
+    /// Внутри папки есть правила, отличающиеся от её собственного состояния («выбрано частично»).
+    func isPartial(_ path: String) -> Bool {
+        let prefix = path == "/" ? "/" : path + "/"
+        if isIncluded(path) { return excluded.contains { $0.hasPrefix(prefix) } }
+        return selected.contains { $0.hasPrefix(prefix) }
+    }
+
+    /// Папка показывается отмеченной, если синхронизируется сама или хотя бы что-то внутри неё.
+    func isChecked(_ path: String) -> Bool { isIncluded(path) || isPartial(path) }
 
     func toggle(_ path: String, on: Bool) {
         if path == "/" {
             selected = on ? ["/"] : []
+            excluded = []
             return
         }
-        if on {
-            selected = selected.filter { !$0.hasPrefix(path + "/") }
-            selected.insert(path)
-        } else {
-            selected.remove(path)
+        let prefix = path + "/"
+        selected = selected.filter { $0 != path && !$0.hasPrefix(prefix) }
+        excluded = excluded.filter { $0 != path && !$0.hasPrefix(prefix) }
+        let inherited = nearestRule(path)?.included ?? false
+        if on && !inherited { selected.insert(path) }
+        if !on && inherited { excluded.insert(path) }
+        prune()
+    }
+
+    /// Убирает лишние правила: выбранную папку внутри уже выбранной и исключение вне выбранного.
+    private func prune() {
+        var changed = true
+        while changed {
+            changed = false
+            for r in selected where nearestRule(r, ignoring: r)?.included == true {
+                selected.remove(r); changed = true; break
+            }
+            if changed { continue }
+            for r in excluded where nearestRule(r, ignoring: r)?.included != true {
+                excluded.remove(r); changed = true; break
+            }
         }
     }
 
     func load(_ node: FolderNode) {
-        guard let token = Settings.shared.token, node.children == nil, !node.loading else { return }
+        guard node.children == nil, !node.loading else { return }
+        let token = Settings.shared.token
+        if token == nil && !node.localOnly { return }
         node.loading = true
         node.error = nil
+        let localRoot = Settings.shared.localFolder
         DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let names = try YandexAPI(token: token).listDirs(node.path)
-                DispatchQueue.main.async {
-                    let base = node.path == "/" ? "" : node.path
-                    node.children = names.map { FolderNode(name: $0, path: base + "/" + $0) }
-                    node.loading = false
+            var cloudNames: [String] = []
+            var err: String? = nil
+            if !node.localOnly, let token = token {
+                do { cloudNames = try YandexAPI(token: token).listDirs(node.path) }
+                catch { err = error.localizedDescription }
+            }
+            // Папки, которые есть на Маке, но ещё нет в хранилище, тоже показываем: их можно отметить и выгрузить.
+            var localNames: [String] = []
+            if !localRoot.isEmpty {
+                let rel = node.path == "/" ? "" : (String(node.path.dropFirst()))
+                var url = URL(fileURLWithPath: localRoot)
+                if !rel.isEmpty { url = url.appendingPathComponent(rel) }
+                if let items = try? FileManager.default.contentsOfDirectory(
+                    at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) {
+                    localNames = items.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+                        .map { $0.lastPathComponent.precomposedStringWithCanonicalMapping }
                 }
-            } catch {
-                DispatchQueue.main.async {
-                    node.error = error.localizedDescription
-                    node.children = []
-                    node.loading = false
+            }
+            DispatchQueue.main.async {
+                let base = node.path == "/" ? "" : node.path
+                var nodes = cloudNames.map { FolderNode(name: $0, path: base + "/" + $0) }
+                if !localRoot.isEmpty && !node.cloudOnly {
+                    let localPaths = Set(localNames.map { base + "/" + ($0) })
+                    for n in nodes where !localPaths.contains(n.path) { n.cloudOnly = true }
                 }
+                let known = Set(nodes.map { $0.path })
+                for n in localNames {
+                    let path = base + "/" + (n)
+                    if known.contains(path) { continue }
+                    let ln = FolderNode(name: n, path: path)
+                    ln.localOnly = true
+                    nodes.append(ln)
+                }
+                nodes.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+                node.children = nodes
+                node.error = err
+                if err == nil && node.path == "/" && !node.localOnly && cloudNames.isEmpty && !localNames.isEmpty {
+                    node.error = "Список с сервера пришёл пустым — нажмите «Обновить список»."
+                }
+                node.loading = false
             }
         }
     }
@@ -130,13 +225,18 @@ struct FolderRow: View {
                 }
                 .buttonStyle(PlainButtonStyle())
                 Toggle(isOn: Binding(
-                    get: { model.selected.contains(node.path) || model.isCovered(node.path) },
+                    get: { model.isChecked(node.path) },
                     set: { model.toggle(node.path, on: $0) })) {
                     Label(node.name, systemImage: "folder")
                 }
-                .disabled(model.isCovered(node.path))
-                if model.hasNestedSelection(node.path) {
-                    Text("выбрано внутри").font(.caption).foregroundColor(.orange)
+                if node.localOnly {
+                    Text("только на Маке").font(.caption.weight(.medium)).foregroundColor(TagColor.mac)
+                }
+                if node.cloudOnly {
+                    Text("только в облаке").font(.caption.weight(.medium)).foregroundColor(TagColor.cloud)
+                }
+                if model.isPartial(node.path) {
+                    Text("выбрано частично").font(.caption.weight(.medium)).foregroundColor(TagColor.warn)
                 }
             }
             .padding(.leading, CGFloat(level) * 18)
@@ -163,9 +263,14 @@ struct FolderPickerView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 6) {
                     Toggle(isOn: Binding(
-                        get: { model.selected.contains("/") },
+                        get: { model.isChecked("/") },
                         set: { model.toggle("/", on: $0) })) {
-                        Label("Весь Диск (корень)", systemImage: "externaldrive")
+                        HStack(spacing: 4) {
+                            Label("Весь Диск (корень)", systemImage: "externaldrive")
+                            if model.isPartial("/") {
+                                Text("выбрано частично").font(.caption.weight(.medium)).foregroundColor(TagColor.warn)
+                            }
+                        }
                     }
                     FolderList(node: model.root, model: model, level: 1)
                 }
@@ -376,6 +481,7 @@ struct SettingsView: View {
         Settings.shared.clientID = clientID
         Settings.shared.localFolder = localFolder
         Settings.shared.selectedFolders = model.result
+        Settings.shared.excludedFolders = model.excludedResult
         Settings.shared.selectionConfirmed = true
         Settings.shared.intervalMinutes = interval
         onApply()

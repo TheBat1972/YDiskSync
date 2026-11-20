@@ -69,6 +69,11 @@ final class Settings {
         }
         set { d.set(Settings.normalize(newValue), forKey: "selectedFolders") }
     }
+    /// Исключения: папки внутри выбранной, которые синхронизировать не нужно.
+    var excludedFolders: [String] {
+        get { Settings.normalize(d.stringArray(forKey: "excludedFolders") ?? []) }
+        set { d.set(Settings.normalize(newValue), forKey: "excludedFolders") }
+    }
     /// Пользователь хотя бы раз явно выбрал, что синхронизировать.
     var selectionConfirmed: Bool {
         get { d.bool(forKey: "selectionConfirmed") }
@@ -83,7 +88,7 @@ final class Settings {
         set { d.set(newValue, forKey: "paused") }
     }
 
-    /// Приводит пути к виду "/A/B", убирает дубли и папки, вложенные в уже выбранные.
+    /// Приводит пути к виду "/A/B", убирает дубли (вложенность разбирает окно выбора).
     static func normalize(_ list: [String]) -> [String] {
         var items: [String] = []
         for var p in list {
@@ -93,9 +98,7 @@ final class Settings {
             while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
             items.append(p.precomposedStringWithCanonicalMapping)
         }
-        if items.contains("/") { return ["/"] }
-        let unique = Array(Set(items)).sorted()
-        return unique.filter { p in !unique.contains { $0 != p && p.hasPrefix($0 + "/") } }
+        return Array(Set(items)).sorted()
     }
 
     var isConfigured: Bool { token != nil && !localFolder.isEmpty && selectionConfirmed && !selectedFolders.isEmpty }

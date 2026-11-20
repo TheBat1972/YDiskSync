@@ -290,8 +290,21 @@ final class SyncEngine {
         // Выбранные папки Диска
         let selections = settings.selectedFolders
         let selRels = selections.map { $0 == "/" ? "" : String($0.dropFirst()) }
+        // Исключения: ближайшее (самое глубокое) правило побеждает — внутри выбранной папки можно исключить вложенную.
+        let exRels = settings.excludedFolders.map { String($0.dropFirst()) }
+        let cacheSel = selections + settings.excludedFolders.map { "-" + $0 }
+        // Читаем только корневые выбранные папки: вложенные уже входят в прочитанное дерево.
+        let readRoots = selections.filter { s in !selections.contains { $0 != s && ($0 == "/" || s.hasPrefix($0 + "/")) } }
         func inSelection(_ key: String) -> Bool {
-            selRels.contains { $0.isEmpty || key == $0 || key.hasPrefix($0 + "/") }
+            var best = -1
+            var included = false
+            for r in selRels where r.isEmpty || key == r || key.hasPrefix(r + "/") {
+                if r.count > best { best = r.count; included = true }
+            }
+            for e in exRels where key == e || key.hasPrefix(e + "/") {
+                if e.count >= best { best = e.count; included = false }
+            }
+            return included
         }
 
         func localURL(_ rel: String) -> URL { localRoot.appendingPathComponent(rel) }
@@ -311,6 +324,7 @@ final class SyncEngine {
         func isAncestorOfSelection(_ key: String) -> Bool { selRels.contains { $0.hasPrefix(key + "/") } }
         let orphans = state.keys.filter { !inSelection($0) }.sorted { $0.count < $1.count }
         var trashedRoots: [String] = []
+        var trashedTops: [String] = []
         var nOrphan = 0
         for key in orphans {
             if isAncestorOfSelection(key) || trashedRoots.contains(where: { key.hasPrefix($0 + "/") }) {
@@ -322,6 +336,7 @@ final class SyncEngine {
                 do {
                     try fm.trashItem(at: url, resultingItemURL: nil)
                     nOrphan += 1
+                    trashedTops.append(key)
                     if state[key]?.isDir == true { trashedRoots.append(key) }
                     ActivityLog.shared.add(.delete, "Убрано из синхронизации: " + (key as NSString).lastPathComponent,
                                            key + " — удалено с Мака (в Корзину), на Диске осталось")
@@ -330,12 +345,31 @@ final class SyncEngine {
             newState[key] = nil
         }
 
+        // Убранное с Мака записываем в состояние сразу: иначе при сбое позже это сочтут удалением пользователем и повторят на сервере.
+        saveState(newState, stateURL)
+
+        // Пустые папки-контейнеры (например, «X», когда были выбраны только «X/Y» и «X/Z»), остающиеся после снятия выбора.
+        var checkedParents = Set<String>()
+        for key in trashedTops {
+            var parent = (key as NSString).deletingLastPathComponent
+            while !parent.isEmpty && parent != "/" && !checkedParents.contains(parent) {
+                checkedParents.insert(parent)
+                if inSelection(parent) || isAncestorOfSelection(parent) { break }
+                let purl = localURL(parent)
+                guard let rest = try? fm.contentsOfDirectory(atPath: purl.path),
+                      rest.allSatisfy({ $0 == ".DS_Store" }) else { break }
+                if (try? fm.trashItem(at: purl, resultingItemURL: nil)) == nil { break }
+                newState[parent] = nil
+                parent = (parent as NSString).deletingLastPathComponent
+            }
+        }
+
         // Диск
         var remote: [String: RemoteItem] = [:]
         lock.lock()
         let cached = remoteCache
         let cachedDate = remoteCacheDate
-        let usedCache = !fullRead && cached != nil && remoteCacheSel == selections
+        let usedCache = !fullRead && cached != nil && remoteCacheSel == cacheSel
             && Date().timeIntervalSince(cachedDate) < 900
         remoteCache = nil                  // вернём только после успешного цикла
         lock.unlock()
@@ -343,7 +377,7 @@ final class SyncEngine {
         let readStart = Date()
         var lastTick = Date.distantPast
         var readFast = false
-        for sel in selections where !usedCache {
+        for sel in readRoots where !usedCache {
             let selRel = sel == "/" ? "" : String(sel.dropFirst())
             let dirItem = RemoteItem(isDir: true, size: 0, md5: nil, modified: Date(), apiPath: sel)
             let progressCb: (Int, Int) -> Void = { folders, objects in
@@ -399,6 +433,15 @@ final class SyncEngine {
         onStatus?(.syncing("Просмотр папки на Маке…", nil))
 
         // Локальная папка (только то, что внутри выбранного)
+        if !exRels.isEmpty { remote = remote.filter { inSelection($0.key) } }
+        // Защита: сервер вернул пустой список, хотя мы знаем много файлов, — это сбой чтения, а не «всё удалено».
+        do {
+            let rootDirs = selRels.filter { !$0.isEmpty }.count
+            let knownCount = state.keys.filter(inSelection).count
+            if remote.count <= rootDirs && knownCount > 20 {
+                throw SyncError.bad("Сервер вернул пустой список (известно \(knownCount) объектов). Синхронизация остановлена, чтобы ничего не потерять.")
+            }
+        }
         let local = try scanLocal(localRoot).filter { inSelection($0.key) }
 
         func localMD5(_ rel: String, _ l: LocalItem, _ s: FileState?) throws -> String {
@@ -445,7 +488,7 @@ final class SyncEngine {
                     } else if l.isDir { mkRemote.append(rel) } else { up.append(rel) }
                 } else if let r = r {                       // есть только на Диске
                     if let s = s {
-                        if !r.isDir && r.md5 != s.md5 { down.append(rel) } else { delRemote.append(rel) }  // удалено локально
+                        if !r.isDir && r.md5 != s.md5 { down.append(rel) } else if r.isDir && selRels.contains(rel) { mkLocal.append(rel) } else { delRemote.append(rel) }  // удалено локально
                     } else if r.isDir { mkLocal.append(rel) } else { down.append(rel) }
                 } else {
                     newState[rel] = nil
@@ -458,6 +501,258 @@ final class SyncEngine {
         up = up.filter { rel in
             if let l = local[rel], now - l.mtime < 2 { rerunSoon = true; return false }
             return true
+        }
+
+        // Папку переименовали или перенесли: на Диске переносим её одним запросом, а не заливаем всё заново.
+        // Узнаём по содержимому: тот же набор вложенных файлов и папок с теми же размерами.
+        // Выбранная папка, которую переименовали на Маке: она в mkLocal (защита корня), но по сути «удалена» на Маке.
+        let goneDirs: [String] = mkLocal.filter { local[$0] == nil && state[$0] != nil && remote[$0]?.isDir == true }
+        if !mkRemote.isEmpty && !(delRemote.isEmpty && goneDirs.isEmpty) {
+            let delSet = Set(delRemote).union(goneDirs), mkSet = Set(mkRemote)
+            func isTop(_ rel: String, _ set: Set<String>) -> Bool {
+                let p = (rel as NSString).deletingLastPathComponent
+                return p.isEmpty || !set.contains(p)
+            }
+            let oldTops = (delRemote + goneDirs).filter { remote[$0]?.isDir == true && isTop($0, delSet) }
+            let newTops = mkRemote.filter { isTop($0, mkSet) }
+            if !oldTops.isEmpty && !newTops.isEmpty {
+                func sigOld(_ top: String) -> String? {
+                    let prefix = top + "/"
+                    var parts: [String] = []
+                    for (k, r) in remote where k.hasPrefix(prefix) {
+                        if !delSet.contains(k) || local[k] != nil { return nil }   // внутри что-то остаётся — это не переименование
+                        parts.append(String(k.dropFirst(prefix.count)) + (r.isDir ? "/" : "|\(r.size)"))
+                    }
+                    return parts.isEmpty ? nil : parts.sorted().joined(separator: "\n")
+                }
+                func sigNew(_ top: String) -> String? {
+                    let prefix = top + "/"
+                    var parts: [String] = []
+                    for (k, l) in local where k.hasPrefix(prefix) {
+                        if remote[k] != nil { return nil }
+                        parts.append(String(k.dropFirst(prefix.count)) + (l.isDir ? "/" : "|\(l.size)"))
+                    }
+                    return parts.isEmpty ? nil : parts.sorted().joined(separator: "\n")
+                }
+                var newBySig: [String: [String]] = [:]
+                for t in newTops { if let sg = sigNew(t) { newBySig[sg, default: []].append(t) } }
+                var oldBySig: [String: [String]] = [:]
+                for t in oldTops { if let sg = sigOld(t) { oldBySig[sg, default: []].append(t) } }
+                for (sg, olds) in oldBySig {
+                    guard olds.count == 1, let news = newBySig[sg], news.count == 1 else { continue }   // неоднозначно — не трогаем
+                    let oldTop = olds[0], newTop = news[0]
+                    do {
+                        try api.move(remotePath(oldTop), to: remotePath(newTop))
+                    } catch {
+                        ActivityLog.shared.add(.info, "Не удалось переименовать на Диске, заливаю заново", oldTop + " → " + newTop)
+                        continue
+                    }
+                    let oldPrefix = oldTop + "/"
+                    for k in remote.keys.filter({ $0 == oldTop || $0.hasPrefix(oldPrefix) }) {
+                        guard let item = remote[k] else { continue }
+                        let nk = newTop + String(k.dropFirst(oldTop.count))
+                        remote[nk] = RemoteItem(isDir: item.isDir, size: item.size, md5: item.md5,
+                                                modified: item.modified, apiPath: remotePath(nk))
+                        remote[k] = nil
+                        if let st = state[k] { newState[nk] = st }
+                        newState[k] = nil
+                    }
+                    let newPrefix = newTop + "/"
+                    mkRemote = mkRemote.filter { $0 != newTop && !$0.hasPrefix(newPrefix) }
+                    up = up.filter { !$0.hasPrefix(newPrefix) }
+                    delRemote = delRemote.filter { $0 != oldTop && !$0.hasPrefix(oldPrefix) }
+                    mkLocal = mkLocal.filter { $0 != oldTop && !$0.hasPrefix(oldPrefix) }
+                    // выбор следует за переименованием: иначе старое имя снова создастся пустым
+                    func remap(_ list: [String]) -> [String] {
+                        list.map { (s: String) -> String in
+                            let r = String(s.dropFirst())
+                            if r == oldTop || r.hasPrefix(oldPrefix) { return "/" + newTop + String(r.dropFirst(oldTop.count)) }
+                            return s
+                        }
+                    }
+                    settings.selectedFolders = remap(settings.selectedFolders)
+                    settings.excludedFolders = remap(settings.excludedFolders)
+                    ActivityLog.shared.add(.folder, "Папка переименована на Диске: " + (newTop as NSString).lastPathComponent,
+                                           oldTop + " → " + newTop)
+                }
+            }
+        }
+
+        // Папку переименовали или перенесли на сервере: переносим её и на Маке, а не качаем заново.
+        if !mkLocal.isEmpty && !delLocal.isEmpty {
+            let delSet = Set(delLocal), mkSet = Set(mkLocal), downSet = Set(down)
+            func isTop(_ rel: String, _ set: Set<String>) -> Bool {
+                let p = (rel as NSString).deletingLastPathComponent
+                return p.isEmpty || !set.contains(p)
+            }
+            let oldTops = delLocal.filter { local[$0]?.isDir == true && isTop($0, delSet) }
+            let newTops = mkLocal.filter { isTop($0, mkSet) }
+            if !oldTops.isEmpty && !newTops.isEmpty {
+                func sigOld(_ top: String) -> String? {
+                    let prefix = top + "/"
+                    var parts: [String] = []
+                    for (k, l) in local where k.hasPrefix(prefix) {
+                        if !delSet.contains(k) || remote[k] != nil { return nil }   // внутри что-то остаётся или изменилось
+                        parts.append(String(k.dropFirst(prefix.count)) + (l.isDir ? "/" : "|\(l.size)"))
+                    }
+                    return parts.isEmpty ? nil : parts.sorted().joined(separator: "\n")
+                }
+                func sigNew(_ top: String) -> String? {
+                    let prefix = top + "/"
+                    var parts: [String] = []
+                    for (k, r) in remote where k.hasPrefix(prefix) {
+                        if local[k] != nil || !(mkSet.contains(k) || downSet.contains(k)) { return nil }
+                        parts.append(String(k.dropFirst(prefix.count)) + (r.isDir ? "/" : "|\(r.size)"))
+                    }
+                    return parts.isEmpty ? nil : parts.sorted().joined(separator: "\n")
+                }
+                var newBySig: [String: [String]] = [:]
+                for t in newTops { if let sg = sigNew(t) { newBySig[sg, default: []].append(t) } }
+                var oldBySig: [String: [String]] = [:]
+                for t in oldTops { if let sg = sigOld(t) { oldBySig[sg, default: []].append(t) } }
+                for (sg, olds) in oldBySig {
+                    guard olds.count == 1, let news = newBySig[sg], news.count == 1 else { continue }   // неоднозначно — не трогаем
+                    let oldTop = olds[0], newTop = news[0]
+                    do {
+                        try fm.createDirectory(at: localURL((newTop as NSString).deletingLastPathComponent),
+                                               withIntermediateDirectories: true)
+                        try fm.moveItem(at: localURL(oldTop), to: localURL(newTop))
+                    } catch {
+                        ActivityLog.shared.add(.info, "Не удалось переименовать на Маке, скачиваю заново", oldTop + " → " + newTop)
+                        continue
+                    }
+                    let oldPrefix = oldTop + "/"
+                    for k in state.keys.filter({ $0 == oldTop || $0.hasPrefix(oldPrefix) }) {
+                        let nk = newTop + String(k.dropFirst(oldTop.count))
+                        if let st = state[k] { newState[nk] = st }
+                        newState[k] = nil
+                    }
+                    let newPrefix = newTop + "/"
+                    mkLocal = mkLocal.filter { $0 != newTop && !$0.hasPrefix(newPrefix) }
+                    down = down.filter { !$0.hasPrefix(newPrefix) }
+                    delLocal = delLocal.filter { $0 != oldTop && !$0.hasPrefix(oldPrefix) }
+                    ActivityLog.shared.add(.folder, "Папка переименована на Маке: " + (newTop as NSString).lastPathComponent,
+                                           oldTop + " → " + newTop)
+                }
+            }
+        }
+
+        // Выбранную папку переименовали на Маке, и нового имени нет в выборе: ищем её только среди соседей по папке
+        // (одна папка, быстро) по тому же содержимому и переносим в облаке, а выбор переименовываем.
+        for g in goneDirs where selRels.contains(g) && mkLocal.contains(g) {
+            let gp = g + "/"
+            var rparts: [String] = []
+            for (k, r) in remote where k.hasPrefix(gp) { rparts.append(String(k.dropFirst(gp.count)) + (r.isDir ? "/" : "|\(r.size)")) }
+            if rparts.isEmpty { continue }
+            let rsig = rparts.sorted().joined(separator: "\n")
+            let par = (g as NSString).deletingLastPathComponent
+            let parURL = par.isEmpty ? localRoot : localURL(par)
+            guard let names = try? fm.contentsOfDirectory(atPath: parURL.path) else { continue }
+            var found: [String] = []
+            for n in names where !n.hasPrefix(".") {
+                let cand = par.isEmpty ? n.precomposedStringWithCanonicalMapping : par + "/" + n.precomposedStringWithCanonicalMapping
+                var isD: ObjCBool = false
+                guard fm.fileExists(atPath: localURL(cand).path, isDirectory: &isD), isD.boolValue else { continue }
+                if cand == g || remote[cand] != nil || state[cand] != nil || inSelection(cand) { continue }
+                guard let sub = try? scanLocal(localURL(cand)), !sub.isEmpty else { continue }
+                let csig = sub.map { $0.key + ($0.value.isDir ? "/" : "|\($0.value.size)") }.sorted().joined(separator: "\n")
+                if csig == rsig { found.append(cand) }
+            }
+            guard found.count == 1, let cand = found.first else { continue }
+            do {
+                try api.move(remotePath(g), to: remotePath(cand))
+            } catch {
+                ActivityLog.shared.add(.info, "Не удалось переименовать в облаке", g + " → " + cand)
+                continue
+            }
+            let oldPrefix = g + "/"
+            for k in remote.keys.filter({ $0 == g || $0.hasPrefix(oldPrefix) }) {
+                guard let item = remote[k] else { continue }
+                let nk = cand + String(k.dropFirst(g.count))
+                remote[nk] = RemoteItem(isDir: item.isDir, size: item.size, md5: item.md5, modified: item.modified, apiPath: remotePath(nk))
+                remote[k] = nil
+                if let st = state[k] { newState[nk] = st }
+                newState[k] = nil
+            }
+            mkLocal = mkLocal.filter { $0 != g && !$0.hasPrefix(oldPrefix) }
+            delRemote = delRemote.filter { $0 != g && !$0.hasPrefix(oldPrefix) }
+            func remap(_ list: [String]) -> [String] {
+                list.map { (s: String) -> String in
+                    let r = (String(s.dropFirst()))
+                    if r == g || r.hasPrefix(oldPrefix) { return "/" + (cand + String(r.dropFirst(g.count))) }
+                    return s
+                }
+            }
+            settings.selectedFolders = remap(settings.selectedFolders)
+            settings.excludedFolders = remap(settings.excludedFolders)
+            ActivityLog.shared.add(.folder, "Папка переименована на Маке: " + (cand as NSString).lastPathComponent, g + " → " + cand)
+        }
+
+        // Выбранная папка пропала на Маке и это не переименование — значит её удалили: удаляем в облаке
+        // (в корзину облака) и снимаем с неё выбор, чтобы она не вернулась.
+        do {
+            let gone = goneDirs.filter { mkLocal.contains($0) }
+            if !gone.isEmpty {
+                for g in gone {
+                    let pre = g + "/"
+                    mkLocal = mkLocal.filter { $0 != g && !$0.hasPrefix(pre) }
+                    if !delRemote.contains(g) { delRemote.append(g) }
+                    ActivityLog.shared.add(.folder, "Папка удалена на Маке — удаляю в облаке и снимаю с синхронизации: " + name(g), g)
+                }
+                func drop(_ list: [String]) -> [String] {
+                    list.filter { (s: String) -> Bool in
+                        let r = (String(s.dropFirst()))
+                        return !gone.contains { r == $0 || r.hasPrefix($0 + "/") }
+                    }
+                }
+                settings.selectedFolders = drop(settings.selectedFolders)
+                settings.excludedFolders = drop(settings.excludedFolders)
+            }
+        }
+
+        // Отдельные файлы, которые переименовали или перенесли: переносим, а не передаём заново.
+        // Пара находится по размеру и времени изменения (Мак → сервер) или по размеру и хешу/времени (сервер → Мак);
+        // если подходящих несколько — не гадаем и передаём как обычно.
+        var moveRemote: [String: String] = [:]      // новое имя → старое
+        var moveLocal: [String: String] = [:]
+        do {
+            func pairs(_ gone: [(String, String)], _ fresh: [(String, String)]) -> [(from: String, to: String)] {
+                var g: [String: [String]] = [:], f: [String: [String]] = [:]
+                for (rel, k) in gone { g[k, default: []].append(rel) }
+                for (rel, k) in fresh { f[k, default: []].append(rel) }
+                var out: [(from: String, to: String)] = []
+                for (k, a) in g where a.count == 1 { if let b = f[k], b.count == 1 { out.append((from: a[0], to: b[0])) } }
+                return out
+            }
+            func ms(_ t: Double) -> Int64 { Int64((t * 1000).rounded()) }
+            let goneR: [(String, String)] = delRemote.compactMap { (rel: String) -> (String, String)? in
+                guard let r = remote[rel], !r.isDir, let s = state[rel], s.size > 0 else { return nil }
+                return (rel, "\(s.size)|\(ms(s.mtime))")
+            }
+            let freshR: [(String, String)] = up.compactMap { (rel: String) -> (String, String)? in
+                guard let l = local[rel], !l.isDir, remote[rel] == nil, state[rel] == nil, l.size > 0 else { return nil }
+                return (rel, "\(l.size)|\(ms(l.mtime))")
+            }
+            for p in pairs(goneR, freshR) { moveRemote[p.to] = p.from }
+            let goneL: [(String, String)] = delLocal.compactMap { (rel: String) -> (String, String)? in
+                guard let l = local[rel], !l.isDir, remote[rel] == nil, let s = state[rel], let m = s.md5, s.size > 0 else { return nil }
+                return (rel, "\(s.size)|\(m)")
+            }
+            let freshL: [(String, String)] = down.compactMap { (rel: String) -> (String, String)? in
+                guard let r = remote[rel], !r.isDir, local[rel] == nil, state[rel] == nil, r.size > 0, let m = r.md5 else { return nil }
+                return (rel, "\(r.size)|\(m)")
+            }
+            for p in pairs(goneL, freshL) { moveLocal[p.to] = p.from }
+            if !moveRemote.isEmpty {
+                let fromSet = Set(moveRemote.values), toSet = Set(moveRemote.keys)
+                delRemote = delRemote.filter { !fromSet.contains($0) }
+                up = up.filter { !toSet.contains($0) }
+            }
+            if !moveLocal.isEmpty {
+                let fromSet = Set(moveLocal.values), toSet = Set(moveLocal.keys)
+                delLocal = delLocal.filter { !fromSet.contains($0) }
+                down = down.filter { !toSet.contains($0) }
+            }
         }
 
         // Папка удалена на Маке целиком — в облаке удаляем только её, одним запросом,
@@ -502,7 +797,7 @@ final class SyncEngine {
         }
 
         // MARK: выполнение
-        let total = mkLocal.count + mkRemote.count + down.count + up.count + conflicts.count + dels
+        let total = mkLocal.count + mkRemote.count + down.count + up.count + conflicts.count + dels + moveRemote.count + moveLocal.count
         var done = 0
         let meter = SpeedMeter()
         do {
@@ -520,13 +815,13 @@ final class SyncEngine {
             let planText = parts.isEmpty || total <= 1 ? "" : "План: " + parts.joined(separator: ", ")
             DispatchQueue.main.async { ActivityLog.shared.plan = planText }
         }
-        var nDown = 0, nUp = 0, nDel = 0, nConf = 0
+        var nDown = 0, nUp = 0, nDel = 0, nConf = 0, nMoved = 0
         var lastPoll = Date()
         // Список Облака (с учётом уже сделанного) — чтобы следующий проход не читал Облако заново.
         func keepRemoteCache() {
             lock.lock()
             remoteCache = remote
-            remoteCacheSel = selections
+            remoteCacheSel = cacheSel
             remoteCacheDate = usedCache ? cachedDate : readStart
             lock.unlock()
         }
@@ -671,12 +966,68 @@ final class SyncEngine {
                 }
                 for (k, rel) in batch.enumerated() {
                     try step("Папка " + name(rel))
-                    if let e = results[k] { try fail(rel, e); continue }
+                    if let e = results[k] {
+                        // Список из памяти мог устареть (папки на сервере удалили вне программы): читаем заново.
+                        if usedCache, case SyncError.http(let c, _) = e, c == 409 || c == 404 {
+                            lock.lock(); pendingFull = true; pending = true; remoteCache = nil; lock.unlock()
+                            stLock.lock(); saveState(newState, stateURL); stLock.unlock()
+                            ActivityLog.shared.add(.info, "Список устарел — читаю заново", rel)
+                            throw CycleInterrupted()
+                        }
+                        try fail(rel, e); continue
+                    }
                     remote[rel] = RemoteItem(isDir: true, size: 0, md5: nil, modified: Date(), apiPath: remotePath(rel))
                     newState[rel] = FileState(isDir: true, md5: nil, size: 0, mtime: 0)
                     ActivityLog.shared.add(.folder, "Создана папка на Диске: " + name(rel), rel)
                 }
             }
+        }
+        // Переносы файлов: на сервере одним запросом, на Маке — перемещением.
+        func doMoveRemote(_ from: String, _ to: String) throws {
+            do {
+                try api.move(remotePath(from), to: remotePath(to))
+            } catch {
+                // перенос не вышел — по-старому: заливаем новый файл и убираем старый
+                try doUpload(to)
+                try? api.delete(remote[from]?.apiPath ?? remotePath(from))
+                stLock.lock(); remote[from] = nil; newState[from] = nil; stLock.unlock()
+                return
+            }
+            stLock.lock()
+            if let item = remote[from] {
+                remote[to] = RemoteItem(isDir: false, size: item.size, md5: item.md5, modified: item.modified, apiPath: remotePath(to))
+                remote[from] = nil
+            }
+            newState[to] = state[from]
+            newState[from] = nil
+            nMoved += 1
+            stLock.unlock()
+            ActivityLog.shared.add(.info, "Перенесено на сервере: " + name(to), from + " → " + to)
+        }
+
+        func doMoveLocal(_ from: String, _ to: String) throws {
+            let dst = localURL(to)
+            try fm.createDirectory(at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try fm.moveItem(at: localURL(from), to: dst)
+            let st = try statLocal(dst)
+            stLock.lock()
+            if let r = remote[to] {
+                newState[to] = FileState(isDir: false, md5: r.md5, size: st.size, mtime: st.mtime)
+            }
+            newState[from] = nil
+            nMoved += 1
+            stLock.unlock()
+            ActivityLog.shared.add(.info, "Перенесено на Маке: " + name(to), from + " → " + to)
+        }
+
+        try parallelEach(moveRemote.keys.sorted(), { "⇄ " + name($0) }) { to in
+            guard let from = moveRemote[to] else { return }
+            try doMoveRemote(from, to)
+        }
+        for to in moveLocal.keys.sorted() {
+            guard let from = moveLocal[to] else { continue }
+            try step("Перенос " + name(to))
+            do { try doMoveLocal(from, to) } catch { try fail(to, error) }
         }
         try parallelEach(down.sorted().filter { remote[$0] != nil }, { "↓ " + ($0 as NSString).lastPathComponent }) { rel in
             if let r = remote[rel] { try doDownload(rel, r) }
@@ -707,6 +1058,10 @@ final class SyncEngine {
         // Удаления: сначала файлы, потом папки (от самых вложенных)
         for rel in delLocal.sorted() where local[rel]?.isDir == false {
             try step("Удаление " + (rel as NSString).lastPathComponent)
+            // защита от гонки: файл изменили после составления плана — не трогаем, перечитаем на следующем проходе
+            if let l0 = local[rel], let cur = try? statLocal(localURL(rel)), cur.size != l0.size || abs(cur.mtime - l0.mtime) > 0.5 {
+                rerunSoon = true; continue
+            }
             do {
                 try fm.trashItem(at: localURL(rel), resultingItemURL: nil)
                 newState[rel] = nil
@@ -764,6 +1119,7 @@ final class SyncEngine {
         var parts: [String] = []
         if nDown > 0 { parts.append("скачано: \(nDown)") }
         if nUp > 0 { parts.append("загружено: \(nUp)") }
+        if nMoved > 0 { parts.append("перенесено: \(nMoved)") }
         if nDel + nOrphan > 0 { parts.append("удалено: \(nDel + nOrphan)") }
         if nConf > 0 { parts.append("конфликтов: \(nConf)") }
         let summary = parts.joined(separator: ", ")

@@ -42,6 +42,8 @@ final class YandexAPI {
     private let token: String
     private let session: URLSession
     private static let iso = ISO8601DateFormatter()
+    /// Плоский список файлов всего Диска, прочитанный в этом проходе (экземпляр создаётся на каждый проход).
+    private var flatCache: [[String: Any]]?
 
     init(token: String) {
         self.token = token
@@ -213,33 +215,42 @@ final class YandexAPI {
                       progress: ((Int, Int) -> Void)? = nil) throws -> [String: RemoteItem]? {
         var result: [String: RemoteItem] = [:]
         let prefix = root == "/" ? "/" : root + "/"
-        var offset = 0
-        let fields = "items.path,items.type,items.size,items.md5,items.modified"
-        while true {
-            let (d, c) = try api("GET", "/resources/files",
-                                 [("limit", "1000"), ("offset", String(offset)), ("fields", fields)])
-            guard c == 200, let o = json(d) else { throw SyncError.http(c, message(d)) }
-            let items = (o["items"] as? [[String: Any]]) ?? []
-            if items.isEmpty { break }
-            offset += items.count
-            for it in items {
-                guard var path = it["path"] as? String else { continue }
-                if path.hasPrefix("disk:") { path.removeFirst(5) }
-                guard path.hasPrefix(prefix) else { continue }
-                let rel = String(path.dropFirst(prefix.count)).precomposedStringWithCanonicalMapping
-                let modified = (it["modified"] as? String).flatMap { YandexAPI.iso.date(from: $0) } ?? Date()
-                result[rel] = RemoteItem(isDir: false, size: (it["size"] as? NSNumber)?.int64Value ?? 0,
-                                         md5: it["md5"] as? String, modified: modified, apiPath: path)
-                // родительские папки
-                var parent = (rel as NSString).deletingLastPathComponent
-                while !parent.isEmpty, result[parent] == nil {
-                    let ap = (root == "/" ? "" : root) + "/" + parent
-                    result[parent] = RemoteItem(isDir: true, size: 0, md5: nil, modified: modified, apiPath: ap)
-                    parent = (parent as NSString).deletingLastPathComponent
-                }
+        // Плоский список — по всему Диску; при нескольких выбранных папках читаем его один раз за проход.
+        let all: [[String: Any]]
+        if let c = flatCache {
+            all = c
+        } else {
+            var fetched: [[String: Any]] = []
+            let fields = "items.path,items.type,items.size,items.md5,items.modified"
+            while true {
+                let (d, c) = try api("GET", "/resources/files",
+                                     [("limit", "1000"), ("offset", String(fetched.count)), ("fields", fields)])
+                guard c == 200, let o = json(d) else { throw SyncError.http(c, message(d)) }
+                let items = (o["items"] as? [[String: Any]]) ?? []
+                if items.isEmpty { break }
+                fetched.append(contentsOf: items)
+                progress?(0, fetched.count)
             }
-            progress?(result.values.filter { $0.isDir }.count, result.count)
+            flatCache = fetched
+            all = fetched
         }
+        for it in all {
+            guard var path = it["path"] as? String else { continue }
+            if path.hasPrefix("disk:") { path.removeFirst(5) }
+            guard path.hasPrefix(prefix) else { continue }
+            let rel = String(path.dropFirst(prefix.count)).precomposedStringWithCanonicalMapping
+            let modified = (it["modified"] as? String).flatMap { YandexAPI.iso.date(from: $0) } ?? Date()
+            result[rel] = RemoteItem(isDir: false, size: (it["size"] as? NSNumber)?.int64Value ?? 0,
+                                     md5: it["md5"] as? String, modified: modified, apiPath: path)
+            // родительские папки
+            var parent = (rel as NSString).deletingLastPathComponent
+            while !parent.isEmpty, result[parent] == nil {
+                let ap = (root == "/" ? "" : root) + "/" + parent
+                result[parent] = RemoteItem(isDir: true, size: 0, md5: nil, modified: modified, apiPath: ap)
+                parent = (parent as NSString).deletingLastPathComponent
+            }
+        }
+        progress?(result.values.filter { $0.isDir }.count, result.count)
 
         // Известные папки, которых нет в списке: пустые или удалённые — проверяем по одной.
         let missing = knownDirs.filter { result[$0] == nil }.sorted()
@@ -330,6 +341,19 @@ final class YandexAPI {
             cur += "/" + comp
             try makeDir(cur)
         }
+    }
+
+    /// Переименование или перенос файла/папки одним запросом: содержимое остаётся на месте, ничего не заливается заново.
+    func move(_ from: String, to: String) throws {
+        let parent = (to as NSString).deletingLastPathComponent
+        if !parent.isEmpty && parent != "/" { try ensureDir(parent) }
+        let (d, c) = try api("POST", "/resources/move", [("from", from), ("path", to), ("overwrite", "false")])
+        if c == 201 { return }
+        if c == 202 {
+            if let href = json(d)?["href"] as? String { waitOperation(href) }
+            return
+        }
+        throw SyncError.http(c, message(d))
     }
 
     /// Удаление в корзину Диска.
