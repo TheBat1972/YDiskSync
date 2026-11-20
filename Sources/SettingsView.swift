@@ -298,10 +298,11 @@ final class PickerWindowController {
     func show(model: FolderTreeModel) {
         window?.close()
         let snapshot = model.selected
+        let exSnapshot = model.excluded
         let view = FolderPickerView(
             model: model,
             onDone: { [weak self] in self?.window?.close() },
-            onCancel: { [weak self] in model.selected = snapshot; self?.window?.close() })
+            onCancel: { [weak self] in model.selected = snapshot; model.excluded = exSnapshot; self?.window?.close() })
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 560),
                          styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         w.title = "Что синхронизировать"

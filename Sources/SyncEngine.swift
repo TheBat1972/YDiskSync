@@ -506,7 +506,7 @@ final class SyncEngine {
         // Папку переименовали или перенесли: на Диске переносим её одним запросом, а не заливаем всё заново.
         // Узнаём по содержимому: тот же набор вложенных файлов и папок с теми же размерами.
         // Выбранная папка, которую переименовали на Маке: она в mkLocal (защита корня), но по сути «удалена» на Маке.
-        let goneDirs: [String] = mkLocal.filter { local[$0] == nil && state[$0] != nil && remote[$0]?.isDir == true }
+        let goneDirs: [String] = mkLocal.filter { !$0.isEmpty && local[$0] == nil && state[$0] != nil && remote[$0]?.isDir == true }
         if !mkRemote.isEmpty && !(delRemote.isEmpty && goneDirs.isEmpty) {
             let delSet = Set(delRemote).union(goneDirs), mkSet = Set(mkRemote)
             func isTop(_ rel: String, _ set: Set<String>) -> Bool {
