@@ -33,12 +33,17 @@ final class FolderTreeModel: ObservableObject {
     var summary: String {
         if selected.contains("/") { return "Весь Диск" }
         if selected.isEmpty { return "Ничего не выбрано" }
-        let names = selected.sorted().map { ($0 as NSString).lastPathComponent }
+        let names = selected.sorted().map { $0.hasPrefix("/") ? String($0.dropFirst()) : $0 }
         let shown = names.prefix(3).joined(separator: ", ")
         return names.count > 3 ? "\(shown) и ещё \(names.count - 3)" : shown
     }
 
     /// Выбрана ли уже сама папка или её родитель (тогда вложенные включены автоматически).
+    /// Внутри папки выбрана какая-то вложенная папка (сама папка при этом не отмечена).
+    func hasNestedSelection(_ path: String) -> Bool {
+        selected.contains { $0.hasPrefix(path + "/") }
+    }
+
     func isCovered(_ path: String) -> Bool {
         selected.contains("/") || selected.contains { path.hasPrefix($0 + "/") }
     }
@@ -130,6 +135,9 @@ struct FolderRow: View {
                     Label(node.name, systemImage: "folder")
                 }
                 .disabled(model.isCovered(node.path))
+                if model.hasNestedSelection(node.path) {
+                    Text("выбрано внутри").font(.caption).foregroundColor(.orange)
+                }
             }
             .padding(.leading, CGFloat(level) * 18)
             if node.expanded {
