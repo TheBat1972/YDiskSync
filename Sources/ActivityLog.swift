@@ -56,18 +56,26 @@ final class ActivityLog: ObservableObject {
     }
 }
 
-/// Скорость передачи файлов: по закачкам/выгрузкам, закончившимся за последние 20 секунд.
+/// Скорость и оценка оставшегося времени. Вызывается из нескольких потоков одновременно.
 final class SpeedMeter {
-    private var recent: [(end: Date, bytes: Int64, secs: Double)] = []
+    private let mu = NSLock()
+    private var recent: [(start: Date, end: Date, bytes: Int64)] = []
     private var total: Int64 = 0
+    private var files = 0
     private var planned: Int64 = 0
-
+    private var plannedFiles = 0
     private var foldersStart: Date?
     private var foldersShown = Date.distantPast
 
+    init() { DispatchQueue.main.async { ActivityLog.shared.speed = "" } }
+
+    /// Сколько байт и файлов предстоит передать в этом цикле.
+    func plan(_ bytes: Int64, files: Int) { mu.lock(); planned = bytes; plannedFiles = files; mu.unlock() }
+
     /// Этап создания папок: файлов ещё не передавали — показываем темп и сколько осталось.
     func folder(_ n: Int, of m: Int) {
-        guard total == 0, m > 0 else { return }
+        mu.lock(); defer { mu.unlock() }
+        guard total == 0, files == 0, m > 0 else { return }
         let now = Date()
         if foldersStart == nil { foldersStart = now }
         guard now.timeIntervalSince(foldersShown) > 1 || n >= m else { return }
@@ -81,24 +89,29 @@ final class SpeedMeter {
         DispatchQueue.main.async { ActivityLog.shared.speed = text }
     }
 
-    /// Сколько байт всего предстоит передать в этом цикле.
-    func plan(_ bytes: Int64) { planned = bytes }
-
-    init() { DispatchQueue.main.async { ActivityLog.shared.speed = "" } }
-
     func record(_ url: URL, since start: Date) {
         let bytes = ((try? url.resourceValues(forKeys: [.fileSizeKey]))?.fileSize).map(Int64.init) ?? 0
         let now = Date()
+        mu.lock(); defer { mu.unlock() }
         total += bytes
-        recent.append((now, bytes, max(now.timeIntervalSince(start), 0.001)))
+        files += 1
+        recent.append((start, now, bytes))
         recent.removeAll { now.timeIntervalSince($0.end) > 20 }
-        let b = recent.reduce(Int64(0)) { $0 + $1.bytes }
-        let s = recent.reduce(0.0) { $0 + $1.secs }
-        let speed = Double(b) / s
-        var text = "Скорость: \(Self.fmt(speed))/с · передано \(Self.fmt(Double(total)))"
-        if planned > total {
-            text += " из \(Self.fmt(Double(planned)))"
-            if speed > 0 { text += " · осталось " + Self.eta(Double(planned - total) / speed) }
+        // Скорость считаем по реальному времени: передачи идут одновременно, их длительности складывать нельзя.
+        let from = recent.map { $0.start }.min() ?? now
+        let wall = max(now.timeIntervalSince(from), 0.5)
+        let rBytes = recent.reduce(Int64(0)) { $0 + $1.bytes }
+        let bw = Double(rBytes) / wall
+        let fps = Double(recent.count) / wall
+
+        var text = rBytes >= 2_000_000 ? "Скорость: \(Self.fmt(bw))/с" : "Файлов в минуту: \(Int(fps * 60 + 0.5))"
+        text += " · передано \(Self.fmt(Double(total)))"
+        if planned > total { text += " из \(Self.fmt(Double(planned)))" }
+        let filesLeft = max(plannedFiles - files, 0)
+        if filesLeft > 0 && files >= 10 && fps > 0 {
+            var est = Double(filesLeft) / fps                       // упираемся в число запросов
+            if bw > 0 { est = max(est, Double(max(planned - total, 0)) / bw) }   // или в пропускную способность
+            text += " · осталось " + Self.eta(est)
         }
         DispatchQueue.main.async { ActivityLog.shared.speed = text }
     }

@@ -204,6 +204,90 @@ final class YandexAPI {
         return result
     }
 
+    /// Быстрое чтение: плоский список всех файлов Диска (десятки запросов вместо запроса на каждую папку).
+    /// Папки восстанавливаются по путям файлов. Пустых папок в плоском списке нет, поэтому
+    /// известные нам папки (knownDirs — относительные пути), которых в списке не оказалось,
+    /// проверяются отдельно: пустая папка остаётся, удалённая — исчезает.
+    /// nil — самой папки на Диске нет.
+    func listTreeFast(root: String, knownDirs: Set<String>,
+                      progress: ((Int, Int) -> Void)? = nil) throws -> [String: RemoteItem]? {
+        var result: [String: RemoteItem] = [:]
+        let prefix = root == "/" ? "/" : root + "/"
+        var offset = 0
+        let fields = "items.path,items.type,items.size,items.md5,items.modified"
+        while true {
+            let (d, c) = try api("GET", "/resources/files",
+                                 [("limit", "1000"), ("offset", String(offset)), ("fields", fields)])
+            guard c == 200, let o = json(d) else { throw SyncError.http(c, message(d)) }
+            let items = (o["items"] as? [[String: Any]]) ?? []
+            if items.isEmpty { break }
+            offset += items.count
+            for it in items {
+                guard var path = it["path"] as? String else { continue }
+                if path.hasPrefix("disk:") { path.removeFirst(5) }
+                guard path.hasPrefix(prefix) else { continue }
+                let rel = String(path.dropFirst(prefix.count)).precomposedStringWithCanonicalMapping
+                let modified = (it["modified"] as? String).flatMap { YandexAPI.iso.date(from: $0) } ?? Date()
+                result[rel] = RemoteItem(isDir: false, size: (it["size"] as? NSNumber)?.int64Value ?? 0,
+                                         md5: it["md5"] as? String, modified: modified, apiPath: path)
+                // родительские папки
+                var parent = (rel as NSString).deletingLastPathComponent
+                while !parent.isEmpty, result[parent] == nil {
+                    let ap = (root == "/" ? "" : root) + "/" + parent
+                    result[parent] = RemoteItem(isDir: true, size: 0, md5: nil, modified: modified, apiPath: ap)
+                    parent = (parent as NSString).deletingLastPathComponent
+                }
+            }
+            progress?(result.values.filter { $0.isDir }.count, result.count)
+        }
+
+        // Известные папки, которых нет в списке: пустые или удалённые — проверяем по одной.
+        let missing = knownDirs.filter { result[$0] == nil }.sorted()
+        if missing.count > 30 {
+            // Слишком много, чтобы проверять по одной (это минуты): считаем, что они на месте.
+            // Если какая-то папка на самом деле удалена, это выяснится при ежесуточном полном чтении.
+            for rel in missing {
+                let ap = (root == "/" ? "" : root) + "/" + rel
+                result[rel] = RemoteItem(isDir: true, size: 0, md5: nil, modified: Date(), apiPath: ap)
+            }
+        } else if !missing.isEmpty {
+            let lock = NSLock()
+            var failure: Error?
+            let limiter = DispatchSemaphore(value: 6)
+            let group = DispatchGroup()
+            for rel in missing {
+                limiter.wait()
+                group.enter()
+                DispatchQueue.global(qos: .utility).async {
+                    defer { limiter.signal(); group.leave() }
+                    let ap = (root == "/" ? "" : root) + "/" + rel
+                    do {
+                        let (d, c) = try self.api("GET", "/resources", [("path", ap), ("limit", "0"), ("fields", "type")])
+                        if c == 200, (self.json(d)?["type"] as? String) == "dir" {
+                            lock.lock()
+                            result[rel] = RemoteItem(isDir: true, size: 0, md5: nil, modified: Date(), apiPath: ap)
+                            lock.unlock()
+                        } else if c != 404 {
+                            throw SyncError.http(c, self.message(d))
+                        }
+                    } catch {
+                        lock.lock(); if failure == nil { failure = error }; lock.unlock()
+                    }
+                }
+            }
+            group.wait()
+            if let e = failure { throw e }
+        }
+
+        if root != "/" && result.isEmpty {
+            // под корнем ничего нет: пустая папка или её нет совсем
+            let (d, c) = try api("GET", "/resources", [("path", root), ("limit", "0"), ("fields", "type")])
+            if c == 404 { return nil }
+            guard c == 200, (json(d)?["type"] as? String) == "dir" else { throw SyncError.http(c, message(d)) }
+        }
+        return result
+    }
+
     /// Имена подпапок (только папки) — для дерева выбора в настройках.
     func listDirs(_ path: String) throws -> [String] {
         var names: [String] = []

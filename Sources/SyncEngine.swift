@@ -80,7 +80,7 @@ final class SyncEngine {
             self.lock.unlock()
             if nowOnline && !was {
                 ActivityLog.shared.add(.info, "Сеть появилась", "Продолжаю синхронизацию")
-                DispatchQueue.main.async { self.requestSync() }
+                DispatchQueue.main.async { self.requestSync(fullRead: false) }   // прочитанный список ещё годен
             } else if !nowOnline && was {
                 ActivityLog.shared.add(.info, "Нет подключения к интернету", "Синхронизация продолжится, когда сеть вернётся")
                 self.onStatus?(.error("Нет подключения к интернету"))
@@ -212,7 +212,7 @@ final class SyncEngine {
             self.retryItem?.cancel()
             let delay = self.retryDelay
             self.retryDelay = min(self.retryDelay * 2, 120)
-            let item = DispatchWorkItem { [weak self] in self?.requestSync() }
+            let item = DispatchWorkItem { [weak self] in self?.requestSync(fullRead: false) }
             self.retryItem = item
             DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         }
@@ -284,6 +284,7 @@ final class SyncEngine {
         }
         let api = YandexAPI(token: token)
         onStatus?(.syncing("Получение списка файлов…", nil))
+        DispatchQueue.main.async { ActivityLog.shared.speed = ""; ActivityLog.shared.plan = "" }
         if let info = try? api.diskInfo() { onDiskInfo?(info) }
 
         // Выбранные папки Диска
@@ -341,15 +342,42 @@ final class SyncEngine {
         if usedCache, let c = cached { remote = c }
         let readStart = Date()
         var lastTick = Date.distantPast
+        var readFast = false
         for sel in selections where !usedCache {
             let selRel = sel == "/" ? "" : String(sel.dropFirst())
             let dirItem = RemoteItem(isDir: true, size: 0, md5: nil, modified: Date(), apiPath: sel)
-            let tree = try api.listTree(root: sel) { folders, objects in
+            let progressCb: (Int, Int) -> Void = { folders, objects in
                 let now = Date()
                 if now.timeIntervalSince(lastTick) > 0.3 {
                     lastTick = now
                     self.onStatus?(.syncing("Чтение Диска: папок \(folders), объектов \(objects)…", nil))
                 }
+            }
+            // Обычно читаем быстрым плоским списком; раз в сутки (и если он не сработал) — обходом всех папок.
+            let deepKey = "lastDeepRead"
+            let lastDeep = UserDefaults.standard.double(forKey: deepKey)
+            if lastDeep == 0 { UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: deepKey) }  // первый запуск: сразу быстрым способом
+            let needDeep = lastDeep > 0 && Date().timeIntervalSince1970 - lastDeep > 86400
+            var tree: [String: RemoteItem]?
+            var read = false
+            if !needDeep {
+                let known = Set(state.filter { $0.value.isDir && inSelection($0.key) && $0.key != selRel }
+                    .map { selRel.isEmpty ? $0.key : String($0.key.dropFirst(selRel.count + 1)) })
+                do {
+                    self.onStatus?(.syncing("Чтение Диска: запрос списка файлов…", nil))
+                    tree = try api.listTreeFast(root: sel, knownDirs: known, progress: progressCb)
+                    self.onStatus?(.syncing("Чтение Диска: обработка списка…", nil))
+                    read = true
+                readFast = true
+                } catch SyncError.network(let m) { throw SyncError.network(m) }
+                  catch SyncError.unauthorized { throw SyncError.unauthorized }
+                  catch {
+                    ActivityLog.shared.add(.info, "Быстрое чтение не сработало, читаю по папкам", error.localizedDescription)
+                }
+            }
+            if !read {
+                tree = try api.listTree(root: sel, progress: progressCb)
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: deepKey)
             }
             if let tree = tree {
                 if !selRel.isEmpty { remote[selRel] = dirItem }
@@ -364,8 +392,9 @@ final class SyncEngine {
         }
 
         if !usedCache {
+            lock.lock(); pendingFull = false; lock.unlock()   // Диск только что прочитан — повторное полное чтение не нужно
             ActivityLog.shared.add(.info, "Список Диска получен: \(remote.count) объектов",
-                                   String(format: "за %.0f с", Date().timeIntervalSince(readStart)))
+                                   String(format: "за %.0f с", Date().timeIntervalSince(readStart)) + (readFast ? " (быстрое чтение)" : " (по папкам)"))
         }
         onStatus?(.syncing("Просмотр папки на Маке…", nil))
 
@@ -480,7 +509,7 @@ final class SyncEngine {
             // План цикла: что и сколько предстоит передать
             let downBytes = (down + conflicts).reduce(Int64(0)) { $0 + (remote[$1]?.size ?? 0) }
             let upBytes = up.reduce(Int64(0)) { $0 + (local[$1]?.size ?? 0) }
-            meter.plan(downBytes + upBytes)
+            meter.plan(downBytes + upBytes, files: down.count + up.count + conflicts.count)
             var parts: [String] = []
             if !down.isEmpty { parts.append("скачать \(down.count) (\(SpeedMeter.fmt(Double(downBytes))))") }
             if !up.isEmpty { parts.append("загрузить \(up.count) (\(SpeedMeter.fmt(Double(upBytes))))") }
@@ -501,6 +530,8 @@ final class SyncEngine {
             remoteCacheDate = usedCache ? cachedDate : readStart
             lock.unlock()
         }
+        let stLock = NSLock()          // защищает newState, remote и счётчики, пока файлы передаются параллельно
+        keepRemoteCache()              // свежий список не пропадёт, даже если дальше случится сбой
         var foldersDone = 0
         func step(_ text: String) throws {
             done += 1
@@ -514,23 +545,68 @@ final class SyncEngine {
                 lastPoll = Date()
                 lock.lock(); let again = pending; lock.unlock()
                 if again && done < total {
+                    stLock.lock()
                     saveState(newState, stateURL)
                     keepRemoteCache()
+                    stLock.unlock()
                     throw CycleInterrupted()
                 }
             }
         }
+        var netErrors = 0                // ошибок связи подряд; сервер может просто тормозить на отдельных файлах
         func fail(_ rel: String, _ error: Error) throws {
             var fatal = false
             if case SyncError.unauthorized = error { fatal = true }
-            if case SyncError.network = error { fatal = true }   // нет сети — дальше нет смысла
+            if case SyncError.network = error {
+                netErrors += 1
+                if netErrors >= 5 { fatal = true }   // связи действительно нет — дальше нет смысла
+            }
             if fatal {
-                saveState(newState, stateURL)                    // что успели — запомнили
+                stLock.lock(); saveState(newState, stateURL); keepRemoteCache(); stLock.unlock()   // что успели — запомнили
                 throw error
             }
             logError(rel, error)
         }
         func name(_ rel: String) -> String { (rel as NSString).lastPathComponent }
+
+        // Файлы передаём одновременно, до 16 штук, скользящим окном: закончилась одна — стартует следующая.
+        // На мелких файлах время уходит на запросы, а не на данные, поэтому параллельность даёт основной выигрыш.
+        func parallelEach(_ items: [String], _ title: (String) -> String, _ work: @escaping (String) throws -> Void) throws {
+            let limiter = DispatchSemaphore(value: 16)
+            let group = DispatchGroup()
+            let q = DispatchQueue.global(qos: .userInitiated)
+            var finished: [(String, Error?)] = []
+            var thrown: Error?
+            func drain() {
+                stLock.lock(); let list = finished; finished = []; stLock.unlock()
+                for (rel, err) in list where thrown == nil {
+                    do {
+                        try step(title(rel))
+                        if let e = err { try fail(rel, e) } else { netErrors = 0 }
+                    } catch { thrown = error }
+                }
+            }
+            for rel in items {
+                drain()
+                if thrown != nil { break }
+                limiter.wait()
+                group.enter()
+                q.async {
+                    var err: Error?
+                    do { try work(rel) } catch { err = error }
+                    stLock.lock(); finished.append((rel, err)); stLock.unlock()
+                    limiter.signal()
+                    group.leave()
+                }
+            }
+            group.wait()
+            drain()
+            if thrown is CycleInterrupted {
+                // передачи, которые ещё шли, закончились — сохраняем окончательное состояние
+                stLock.lock(); saveState(newState, stateURL); keepRemoteCache(); stLock.unlock()
+            }
+            if let e = thrown { throw e }
+        }
 
         func doDownload(_ rel: String, _ r: RemoteItem) throws {
             let dest = localURL(rel)
@@ -548,8 +624,10 @@ final class SyncEngine {
                 try fm.moveItem(at: tmp, to: dest)
             }
             let st = try statLocal(dest)
+            stLock.lock()
             newState[rel] = FileState(isDir: false, md5: r.md5, size: st.size, mtime: st.mtime)
             nDown += 1
+            stLock.unlock()
             ActivityLog.shared.add(.download, "Скачано с Диска: " + name(rel), rel)
         }
 
@@ -560,9 +638,11 @@ final class SyncEngine {
             let t2 = Date()
             try api.upload(url, to: remotePath(rel))
             meter.record(url, since: t2)
+            stLock.lock()
             remote[rel] = RemoteItem(isDir: false, size: st.size, md5: md5, modified: Date(), apiPath: remotePath(rel))
             newState[rel] = FileState(isDir: false, md5: md5, size: st.size, mtime: st.mtime)
             nUp += 1
+            stLock.unlock()
             ActivityLog.shared.add(.upload, "Загружено на Диск: " + name(rel), rel)
         }
 
@@ -598,15 +678,10 @@ final class SyncEngine {
                 }
             }
         }
-        for rel in down.sorted() {
-            guard let r = remote[rel] else { continue }
-            try step("↓ " + (rel as NSString).lastPathComponent)
-            do { try doDownload(rel, r) } catch { try fail(rel, error) }
+        try parallelEach(down.sorted().filter { remote[$0] != nil }, { "↓ " + ($0 as NSString).lastPathComponent }) { rel in
+            if let r = remote[rel] { try doDownload(rel, r) }
         }
-        for rel in up.sorted() {
-            try step("↑ " + (rel as NSString).lastPathComponent)
-            do { try doUpload(rel) } catch { try fail(rel, error) }
-        }
+        try parallelEach(up.sorted(), { "↑ " + ($0 as NSString).lastPathComponent }) { rel in try doUpload(rel) }
         for rel in conflicts.sorted() {
             guard let r = remote[rel] else { continue }
             try step("Конфликт: " + (rel as NSString).lastPathComponent)
