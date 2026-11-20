@@ -105,6 +105,12 @@ final class FolderTreeModel: ObservableObject {
         let prefix = path + "/"
         selected = selected.filter { $0 != path && !$0.hasPrefix(prefix) }
         excluded = excluded.filter { $0 != path && !$0.hasPrefix(prefix) }
+        // Старые записи, сохранённые без пробела в конце имени, убираем, чтобы они не висели лишними исключениями.
+        let alt = path.trimmingCharacters(in: .whitespaces)
+        if alt != path {
+            selected = selected.filter { $0 != alt && !$0.hasPrefix(alt + "/") }
+            excluded = excluded.filter { $0 != alt && !$0.hasPrefix(alt + "/") }
+        }
         let inherited = nearestRule(path)?.included ?? false
         if on && !inherited { selected.insert(path) }
         if !on && inherited { excluded.insert(path) }

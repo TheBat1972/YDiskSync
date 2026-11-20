@@ -92,7 +92,7 @@ final class Settings {
     static func normalize(_ list: [String]) -> [String] {
         var items: [String] = []
         for var p in list {
-            p = p.trimmingCharacters(in: .whitespacesAndNewlines)
+            p = p.trimmingCharacters(in: .newlines)   // пробелы не трогаем: у папок бывает пробел в конце имени
             if p.hasPrefix("disk:") { p = String(p.dropFirst(5)) }
             if !p.hasPrefix("/") { p = "/" + p }
             while p.count > 1 && p.hasSuffix("/") { p.removeLast() }
